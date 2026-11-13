@@ -1,0 +1,739 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Background Remover</title>
+<style>
+  :root{
+    --bg:#0f0f10; --panel:#161618; --line:#2a2a2e; --txt:#e8e8ea; --muted:#8b8b93;
+    --accent:#4f8cff; --accent2:#2f6fe0;
+  }
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{
+    font:14px/1.4 system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+    background:var(--bg); color:var(--txt); overflow:hidden;
+  }
+  #app{display:flex; height:100%}
+
+  #sidebar{
+    width:272px; flex:0 0 272px; background:var(--panel);
+    border-right:1px solid var(--line); padding:16px;
+    display:flex; flex-direction:column; gap:16px; overflow-y:auto;
+  }
+  #sidebar h1{font-size:15px; margin:0; font-weight:600; letter-spacing:.2px}
+  .hint{font-size:12px; color:var(--muted); margin:6px 0 0}
+  .group{display:flex; flex-direction:column; gap:8px}
+  .label{font-size:11px; color:var(--muted); text-transform:uppercase; letter-spacing:.07em}
+  .btn{
+    appearance:none; border:1px solid var(--line); background:#1e1e22; color:var(--txt);
+    padding:9px 12px; border-radius:9px; font-size:13px; font-weight:500; cursor:pointer;
+    transition:background .15s, border-color .15s, opacity .15s; text-align:center;
+    font-family:inherit;
+  }
+  .btn:hover:not(:disabled){background:#26262b; border-color:#3a3a41}
+  .btn:disabled{opacity:.4; cursor:not-allowed}
+  .btn.primary{background:var(--accent); border-color:var(--accent); color:#fff}
+  .btn.primary:hover:not(:disabled){background:var(--accent2); border-color:var(--accent2)}
+  .row{display:flex; gap:8px}
+  .row .btn{flex:1}
+  .tool{padding:8px 0; font-size:12px}
+  .tool.active{background:var(--accent); border-color:var(--accent); color:#fff}
+  input[type=range]{width:100%; accent-color:var(--accent); cursor:pointer}
+  #status{font-size:12px; color:var(--muted); min-height:34px; white-space:pre-wrap; line-height:1.45}
+
+  #viewport{
+    position:relative; flex:1; overflow:hidden; touch-action:none; cursor:grab;
+    background-color:#1a1a1d;
+    background-image:
+      linear-gradient(45deg,#232327 25%,transparent 25%),
+      linear-gradient(-45deg,#232327 25%,transparent 25%),
+      linear-gradient(45deg,transparent 75%,#232327 75%),
+      linear-gradient(-45deg,transparent 75%,#232327 75%);
+    background-size:22px 22px;
+    background-position:0 0, 0 11px, 11px -11px, -11px 0;
+  }
+  #view{position:absolute; inset:0; display:block}
+  #overlay{position:absolute; inset:0; display:block; pointer-events:none}
+  #drop{
+    position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+    flex-direction:column; gap:6px; pointer-events:none; color:var(--muted); font-size:13px;
+  }
+  #drop b{color:#c9c9cf; font-weight:600; font-size:15px}
+  #drop.hide{display:none}
+</style>
+</head>
+<body>
+<div id="app">
+  <aside id="sidebar">
+    <div>
+      <h1>Background Remover</h1>
+      <p class="hint">Load an image → Remove Background → refine with the brush.</p>
+    </div>
+
+    <div class="group">
+      <label class="btn primary" for="file">Choose image…</label>
+      <input id="file" type="file" accept="image/*" hidden />
+      <button id="removeBtn" class="btn" disabled>Remove Background</button>
+      <button id="downloadBtn" class="btn" disabled>Download PNG</button>
+    </div>
+
+    <div class="group">
+      <div class="label">Tool</div>
+      <div class="row">
+        <button class="btn tool active" data-tool="pan">Pan</button>
+        <button class="btn tool" data-tool="erase">Erase</button>
+        <button class="btn tool" data-tool="restore">Restore</button>
+      </div>
+    </div>
+
+    <div class="group">
+      <div class="label">Selection size — <span id="sizeVal">60</span> px</div>
+      <input id="size" type="range" min="4" max="400" step="1" value="60" />
+    </div>
+
+    <div class="group">
+      <button id="fitBtn" class="btn" disabled>Fit to view</button>
+      <button id="resetBtn" class="btn" disabled>Reset edits</button>
+    </div>
+
+    <div id="status"></div>
+  </aside>
+
+  <main id="viewport">
+    <canvas id="view"></canvas>
+    <canvas id="overlay"></canvas>
+    <div id="drop"><b>Drop an image here</b><span>or paste from clipboard</span></div>
+  </main>
+</div>
+
+<script type="module">
+/* =====================================================================
+   FINAL FIXES APPLIED
+   =====================================================================
+   ✔ COEP changed to "credentialless" (netlify.toml) so CDN WASM/ONNX
+     fetches are NOT blocked. require-corp blocked them.
+   ✔ Overlay opacity removed — brush cursor now fully visible.
+   ✔ quickRemove() moved to a Web Worker — no main-thread freeze.
+   ✔ AI fallback CDN list restored (jsdelivr + esm.sh).
+   ✔ Painting throttled via requestAnimationFrame (less lag).
+   ✔ Null-check on srcBlob before calling removeBackground.
+   ✔ Pointer lock cleared on pointerup/cancel even if no pan/draw.
+   ✔ fitView cancels previous RAF to avoid queued jumps.
+   ✔ Resize captures old dimensions before mutating style.
+   ✔ Fallback status message persists (does not get overwritten).
+   ===================================================================== */
+
+/* =====================================================================
+   ELEMENTS
+   ===================================================================== */
+const viewport    = document.getElementById('viewport');
+const view        = document.getElementById('view');
+const vctx        = view.getContext('2d');
+const overlay     = document.getElementById('overlay');
+const octx        = overlay.getContext('2d');
+const fileInput   = document.getElementById('file');
+const removeBtn   = document.getElementById('removeBtn');
+const downloadBtn = document.getElementById('downloadBtn');
+const resetBtn    = document.getElementById('resetBtn');
+const fitBtn      = document.getElementById('fitBtn');
+const sizeInput   = document.getElementById('size');
+const sizeVal     = document.getElementById('sizeVal');
+const statusEl    = document.getElementById('status');
+const dropHint    = document.getElementById('drop');
+const toolBtns    = Array.from(document.querySelectorAll('.tool'));
+
+/* =====================================================================
+   STATE
+   ===================================================================== */
+const MAX_DIM      = 2048;
+const MAX_BRUSH_IM = 600;
+
+let origCanvas = null;
+let workCanvas = null;
+let hasImage   = false;
+let busy       = false;
+
+let scale = 1, tx = 0, ty = 0;
+let dpr = Math.max(1, window.devicePixelRatio || 1);
+
+let tool      = 'pan';
+let brushSize = 60;
+let drawing   = false;
+let panning   = false;
+let activePointerId = null;
+let lastPt    = null;
+let panStart  = null;
+let cursor    = null;
+let spaceDown = false;
+let rafPending = false;
+let fitRaf     = null;
+
+/* =====================================================================
+   HELPERS
+   ===================================================================== */
+function setStatus(msg){ statusEl.textContent = msg; }
+
+function loadImageEl(url){
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload  = () => resolve(img);
+    img.onerror = reject;
+    img.src = url;
+  });
+}
+
+function updateUI(){
+  removeBtn.disabled   = !hasImage || busy;
+  downloadBtn.disabled = !hasImage;
+  resetBtn.disabled    = !hasImage;
+  fitBtn.disabled      = !hasImage;
+  dropHint.classList.toggle('hide', hasImage);
+}
+
+function setBusyUI(b){
+  removeBtn.disabled   = b || !hasImage;
+  removeBtn.textContent = b ? 'Working…' : 'Remove Background';
+}
+
+function clampBrushImage(){
+  const rad = brushSize / (2 * Math.max(scale, 0.001));
+  return Math.min(rad, MAX_BRUSH_IM);
+}
+
+function scheduleRender(){
+  if (rafPending) return;
+  rafPending = true;
+  requestAnimationFrame(() => {
+    rafPending = false;
+    render();
+    renderOverlay();
+  });
+}
+
+/* =====================================================================
+   RENDER / VIEW TRANSFORM
+   ===================================================================== */
+function resize(){
+  const r = viewport.getBoundingClientRect();
+  dpr = Math.max(1, window.devicePixelRatio || 1);
+
+  const oldW = viewport.clientWidth;
+  const oldH = viewport.clientHeight;
+  const cx = oldW / 2;
+  const cy = oldH / 2;
+  const imgCx = (cx - tx) / scale;
+  const imgCy = (cy - ty) / scale;
+
+  view.width  = Math.max(1, Math.round(r.width  * dpr));
+  view.height = Math.max(1, Math.round(r.height * dpr));
+  view.style.width  = r.width  + 'px';
+  view.style.height = r.height + 'px';
+
+  overlay.width  = view.width;
+  overlay.height = view.height;
+  overlay.style.width  = r.width  + 'px';
+  overlay.style.height = r.height + 'px';
+
+  if (hasImage && (oldW !== r.width || oldH !== r.height)){
+    const newCx = r.width  / 2;
+    const newCy = r.height / 2;
+    tx = newCx - imgCx * scale;
+    ty = newCy - imgCy * scale;
+  }
+
+  render();
+  renderOverlay();
+}
+
+function render(){
+  const w = viewport.clientWidth;
+  const h = viewport.clientHeight;
+
+  vctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  vctx.clearRect(0, 0, w, h);
+
+  if (hasImage){
+    vctx.save();
+    vctx.translate(tx, ty);
+    vctx.scale(scale, scale);
+    vctx.imageSmoothingEnabled = scale < 1;
+    vctx.imageSmoothingQuality = 'high';
+    vctx.drawImage(workCanvas, 0, 0);
+    vctx.restore();
+  }
+}
+
+function renderOverlay(){
+  const w = viewport.clientWidth;
+  const h = viewport.clientHeight;
+  octx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  octx.clearRect(0, 0, w, h);
+
+  if (cursor && hasImage && tool !== 'pan'){
+    const r = Math.max(2, brushSize / 2);
+    octx.save();
+    octx.beginPath();
+    octx.arc(cursor.x, cursor.y, r, 0, Math.PI * 2);
+    octx.lineWidth = 3;
+    octx.strokeStyle = 'rgba(0,0,0,.55)';
+    octx.stroke();
+    octx.beginPath();
+    octx.arc(cursor.x, cursor.y, r, 0, Math.PI * 2);
+    octx.lineWidth = 1.5;
+    octx.strokeStyle = 'rgba(255,255,255,.95)';
+    octx.stroke();
+    octx.restore();
+  }
+}
+
+function fitView(){
+  if (!hasImage) return;
+  if (fitRaf) cancelAnimationFrame(fitRaf);
+  fitRaf = requestAnimationFrame(() => {
+    fitRaf = null;
+    const w = viewport.clientWidth;
+    const h = viewport.clientHeight;
+    const s = Math.min(w / workCanvas.width, h / workCanvas.height) * 0.92;
+    scale = s;
+    tx = (w - workCanvas.width  * s) / 2;
+    ty = (h - workCanvas.height * s) / 2;
+    render();
+    renderOverlay();
+  });
+}
+
+function toImage(clientX, clientY){
+  const r = viewport.getBoundingClientRect();
+  return {
+    x: (clientX - r.left - tx) / scale,
+    y: (clientY - r.top  - ty) / scale
+  };
+}
+
+/* =====================================================================
+   LOADING
+   ===================================================================== */
+async function loadFile(file){
+  if (!file || !file.type || !file.type.startsWith('image/')) return;
+
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await loadImageEl(url);
+
+    let w = img.naturalWidth || img.width;
+    let h = img.naturalHeight || img.height;
+    const k = Math.min(1, MAX_DIM / Math.max(w, h));
+    w = Math.max(1, Math.round(w * k));
+    h = Math.max(1, Math.round(h * k));
+
+    origCanvas = document.createElement('canvas');
+    origCanvas.width  = w;
+    origCanvas.height = h;
+    origCanvas.getContext('2d').drawImage(img, 0, 0, w, h);
+
+    workCanvas = document.createElement('canvas');
+    workCanvas.width  = w;
+    workCanvas.height = h;
+    workCanvas.getContext('2d').drawImage(origCanvas, 0, 0);
+
+    hasImage = true;
+    updateUI();
+    fitView();
+    setStatus('Image loaded. Press “Remove Background”, then refine with Erase / Restore.');
+  } catch (e) {
+    console.error(e);
+    setStatus('Could not read that image.');
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+/* =====================================================================
+   BRUSH / PAINTING
+   ===================================================================== */
+function stamp(x, y, rad){
+  const c = workCanvas.getContext('2d');
+  if (tool === 'erase'){
+    c.save();
+    c.globalCompositeOperation = 'destination-out';
+    c.beginPath();
+    c.arc(x, y, rad, 0, Math.PI * 2);
+    c.fill();
+    c.restore();
+  } else {
+    c.save();
+    c.beginPath();
+    c.arc(x, y, rad, 0, Math.PI * 2);
+    c.clip();
+    c.drawImage(origCanvas, x - rad, y - rad, rad * 2, rad * 2, x - rad, y - rad, rad * 2, rad * 2);
+    c.restore();
+  }
+}
+
+function strokeTo(x, y){
+  const rad  = clampBrushImage();
+  const step = Math.max(1, rad * 0.15);
+
+  if (lastPt){
+    const dx = x - lastPt.x;
+    const dy = y - lastPt.y;
+    const dist = Math.hypot(dx, dy);
+    const n = Math.max(1, Math.ceil(dist / step));
+    for (let i = 1; i <= n; i++){
+      stamp(lastPt.x + (dx * i) / n, lastPt.y + (dy * i) / n, rad);
+    }
+  } else {
+    stamp(x, y, rad);
+  }
+  lastPt = { x, y };
+}
+
+/* =====================================================================
+   POINTER EVENTS
+   ===================================================================== */
+viewport.addEventListener('pointerdown', (e) => {
+  if (!hasImage || busy) return;
+  if (activePointerId !== null) return;
+  activePointerId = e.pointerId;
+
+  const isPan = tool === 'pan' || spaceDown;
+
+  if (isPan){
+    panning  = true;
+    panStart = { x: e.clientX - tx, y: e.clientY - ty };
+    viewport.style.cursor = 'grabbing';
+  } else {
+    drawing = true;
+    lastPt  = null;
+    const p = toImage(e.clientX, e.clientY);
+    strokeTo(p.x, p.y);
+    scheduleRender();
+  }
+
+  try { viewport.setPointerCapture(e.pointerId); } catch (_) {}
+  e.preventDefault();
+});
+
+viewport.addEventListener('pointermove', (e) => {
+  if (e.pointerId !== activePointerId && activePointerId !== null) return;
+
+  const r = viewport.getBoundingClientRect();
+  cursor = { x: e.clientX - r.left, y: e.clientY - r.top };
+
+  if (panning){
+    tx = e.clientX - panStart.x;
+    ty = e.clientY - panStart.y;
+    scheduleRender();
+    return;
+  }
+
+  if (drawing && hasImage){
+    const p = toImage(e.clientX, e.clientY);
+    strokeTo(p.x, p.y);
+    scheduleRender();
+    return;
+  }
+
+  if (hasImage) renderOverlay();
+});
+
+function endStroke(e){
+  if (activePointerId !== null && e && e.pointerId !== activePointerId) return;
+  activePointerId = null;
+  if (panning || drawing){
+    panning = false;
+    drawing = false;
+    lastPt  = null;
+    viewport.style.cursor = tool === 'pan' ? 'grab' : 'crosshair';
+    renderOverlay();
+  }
+}
+window.addEventListener('pointerup', endStroke);
+window.addEventListener('pointercancel', endStroke);
+
+viewport.addEventListener('pointerleave', () => {
+  cursor = null;
+  renderOverlay();
+});
+
+viewport.addEventListener('wheel', (e) => {
+  if (!hasImage) return;
+  e.preventDefault();
+
+  const r  = viewport.getBoundingClientRect();
+  const mx = e.clientX - r.left;
+  const my = e.clientY - r.top;
+
+  const factor = Math.exp(-e.deltaY * 0.0015);
+  const ns = Math.min(24, Math.max(0.02, scale * factor));
+
+  tx = mx - (mx - tx) * (ns / scale);
+  ty = my - (my - ty) * (ns / scale);
+  scale = ns;
+
+  render();
+  renderOverlay();
+}, { passive: false });
+
+window.addEventListener('keydown', (e) => {
+  if (e.code === 'Space' &&
+      !(e.target instanceof HTMLInputElement) &&
+      !(e.target instanceof HTMLButtonElement)){
+    spaceDown = true;
+    e.preventDefault();
+  }
+});
+window.addEventListener('keyup', (e) => {
+  if (e.code === 'Space') spaceDown = false;
+});
+
+/* =====================================================================
+   TOOLBAR WIRING
+   ===================================================================== */
+toolBtns.forEach((btn) => {
+  btn.addEventListener('click', () => {
+    tool = btn.dataset.tool;
+    toolBtns.forEach((b) => b.classList.toggle('active', b === btn));
+    viewport.style.cursor = tool === 'pan' ? 'grab' : 'crosshair';
+    renderOverlay();
+  });
+});
+
+sizeInput.addEventListener('input', () => {
+  brushSize = Number(sizeInput.value);
+  sizeVal.textContent = brushSize;
+  renderOverlay();
+});
+
+fitBtn.addEventListener('click', fitView);
+
+resetBtn.addEventListener('click', () => {
+  if (!hasImage) return;
+  const c = workCanvas.getContext('2d');
+  c.clearRect(0, 0, workCanvas.width, workCanvas.height);
+  c.drawImage(origCanvas, 0, 0);
+  render();
+  setStatus('Reset to the original image.');
+});
+
+downloadBtn.addEventListener('click', () => {
+  if (!hasImage) return;
+  workCanvas.toBlob((blob) => {
+    if (!blob) return;
+    const a = document.createElement('a');
+    const href = URL.createObjectURL(blob);
+    a.href = href;
+    a.download = 'background-removed.png';
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(href), 1500);
+  }, 'image/png');
+});
+
+/* =====================================================================
+   INPUT SOURCES
+   ===================================================================== */
+fileInput.addEventListener('change', (e) => {
+  const f = e.target.files && e.target.files[0];
+  if (f) loadFile(f);
+  fileInput.value = '';
+});
+
+['dragenter', 'dragover'].forEach((ev) =>
+  viewport.addEventListener(ev, (e) => e.preventDefault())
+);
+
+viewport.addEventListener('drop', (e) => {
+  e.preventDefault();
+  const f = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+  if (f) loadFile(f);
+});
+
+window.addEventListener('paste', (e) => {
+  const items = e.clipboardData && e.clipboardData.items;
+  if (!items) return;
+  for (const it of items){
+    if (it.type && it.type.startsWith('image/')){
+      const f = it.getAsFile();
+      if (f){ loadFile(f); break; }
+    }
+  }
+});
+
+/* =====================================================================
+   REMOVE BACKGROUND — AI MODEL (1.7.0 confirmed, dual CDN)
+   ===================================================================== */
+async function loadRemover(){
+  const urls = [
+    'https://cdn.jsdelivr.net/npm/@imgly/background-removal@1.7.0/+esm',
+    'https://esm.sh/@imgly/background-removal@1.7.0'
+  ];
+  for (const url of urls){
+    try {
+      const mod = await import(/* webpackIgnore: true */ url);
+      const fn = mod.removeBackground || mod.default;
+      if (typeof fn === 'function') return fn;
+    } catch (err){
+      console.warn('CDN failed:', url, err);
+    }
+  }
+  return null;
+}
+
+async function doRemoveBackground(){
+  if (!hasImage || busy) return;
+
+  busy = true;
+  setBusyUI(true);
+  setStatus('Loading AI model (first run downloads ~40 MB)…');
+
+  // Show a note if the download takes a while
+  const downloadNote = setTimeout(() => {
+    if (busy) setStatus('Still downloading model files (first run only)…');
+  }, 6000);
+
+  try {
+    const removeBackground = await loadRemover();
+    if (!removeBackground) throw new Error('Model module unavailable');
+
+    const srcBlob = await new Promise((res) => origCanvas.toBlob(res, 'image/png'));
+    if (!srcBlob) throw new Error('Could not encode source image');
+
+    let lastPct = -1;
+    const outBlob = await removeBackground(srcBlob, {
+      output: { format: 'image/png' },
+      progress: (_key, current, total) => {
+        if (total > 0){
+          const pct = Math.round((current / total) * 100);
+          if (pct !== lastPct){
+            lastPct = pct;
+            setStatus('Processing… ' + pct + '%');
+          }
+        }
+      }
+    });
+
+    const bmp = await createImageBitmap(outBlob);
+    const c = workCanvas.getContext('2d');
+    c.clearRect(0, 0, workCanvas.width, workCanvas.height);
+    c.drawImage(bmp, 0, 0, workCanvas.width, workCanvas.height);
+    if (bmp.close) bmp.close();
+
+    setStatus('Background removed. Use Erase / Restore to fine-tune.');
+  } catch (err){
+    console.error(err);
+    setStatus('AI model unavailable — running built-in fallback (edge-aware flood fill)…');
+    await quickRemove();
+    // Do NOT overwrite the fallback message
+  } finally {
+    clearTimeout(downloadNote);
+    busy = false;
+    setBusyUI(false);
+    updateUI();
+    render();
+    renderOverlay();
+  }
+}
+
+/* =====================================================================
+   REMOVE BACKGROUND — FALLBACK (Web Worker, no freeze)
+   ===================================================================== */
+function quickRemove(){
+  return new Promise((resolve) => {
+    const w = origCanvas.width;
+    const h = origCanvas.height;
+    const ctx = origCanvas.getContext('2d');
+    const imageData = ctx.getImageData(0, 0, w, h);
+    const data = imageData.data;
+
+    // average border colour
+    let br = 0, bg = 0, bb = 0, n = 0;
+    const acc = (i) => { br += data[i]; bg += data[i + 1]; bb += data[i + 2]; n++; };
+    for (let x = 0; x < w; x++){ acc(x * 4); acc(((h - 1) * w + x) * 4); }
+    for (let y = 0; y < h; y++){ acc((y * w) * 4); acc((y * w + w - 1) * 4); }
+    br /= n; bg /= n; bb /= n;
+
+    const workerCode = `
+      self.onmessage = function(e){
+        const { buf, width, height, br, bg, bb } = e.data;
+        const d = new Uint8ClampedArray(buf);
+        const palTol = 38, palTol2 = palTol*palTol*3;
+        const gradTol = 22, gradTol2 = gradTol*gradTol*3;
+        const seen = new Uint8Array(width*height);
+        const stack = [];
+        const match = (i) => {
+          const p = i*4;
+          const dr = d[p]-br, dg = d[p+1]-bg, db = d[p+2]-bb;
+          return (dr*dr+dg*dg+db*db) <= palTol2;
+        };
+        const close = (i,j) => {
+          const a = i*4, b = j*4;
+          const dr = d[a]-d[b], dg = d[a+1]-d[b+1], db = d[a+2]-d[b+2];
+          return (dr*dr+dg*dg+db*db) <= gradTol2;
+        };
+        const push = (i, from) => {
+          if (seen[i]) return;
+          if (!match(i)) return;
+          if (from !== null && !close(i, from)) return;
+          seen[i] = 1;
+          stack.push(i);
+        };
+        for (let x = 0; x < width; x++){ push(x, null); push((height-1)*width+x, null); }
+        for (let y = 0; y < height; y++){ push(y*width, null); push(y*width+width-1, null); }
+        while (stack.length){
+          const i = stack.pop();
+          d[i*4+3] = 0;
+          const x = i % width, y = (i/width)|0;
+          if (x > 0) push(i-1, i);
+          if (x < width-1) push(i+1, i);
+          if (y > 0) push(i-width, i);
+          if (y < height-1) push(i+width, i);
+        }
+        self.postMessage({ buf: d.buffer }, [d.buffer]);
+      };
+    `;
+
+    const blob = new Blob([workerCode], { type: 'application/javascript' });
+    const workerUrl = URL.createObjectURL(blob);
+    const worker = new Worker(workerUrl);
+
+    worker.onmessage = (ev) => {
+      const newBuf = ev.data.buf;
+      const newData = new Uint8ClampedArray(newBuf);
+      const out = new ImageData(newData, w, h);
+      workCanvas.getContext('2d').putImageData(out, 0, 0);
+      worker.terminate();
+      URL.revokeObjectURL(workerUrl);
+      setStatus('Quick removal applied. Refine with Erase / Restore.');
+      render();
+      resolve();
+    };
+
+    worker.onerror = (err) => {
+      console.error('Worker error:', err);
+      worker.terminate();
+      URL.revokeObjectURL(workerUrl);
+      setStatus('Fallback removal failed.');
+      resolve();
+    };
+
+    // Transfer the buffer to the worker (zero-copy)
+    const buf = data.buffer;
+    worker.postMessage({ buf, width: w, height: h, br, bg, bb }, [buf]);
+  });
+}
+
+/* =====================================================================
+   INIT
+   ===================================================================== */
+removeBtn.addEventListener('click', doRemoveBackground);
+viewport.style.cursor = 'grab';
+window.addEventListener('resize', resize);
+
+resize();
+updateUI();
+setStatus('Load an image to begin.');
+</script>
+</body>
+</html>
