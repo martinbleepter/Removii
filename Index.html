@@ -96,12 +96,13 @@
   <aside id="sidebar">
     <div>
       <h1>Background Remover</h1>
-      <p class="hint">Mask the subject → Keep (reveal) or Hide (remove) → Apply.</p>
+      <p class="hint">Auto-select or paint a mask → Keep (reveal) or Hide (remove) → Apply.</p>
     </div>
 
     <div class="group">
       <label class="btn primary" for="file">Choose image…</label>
       <input id="file" type="file" accept="image/*" hidden />
+      <button id="autoSelectBtn" class="btn" disabled>Auto-Select Subject</button>
       <button id="removeBtn" class="btn" disabled>Remove Background</button>
       <button id="downloadBtn" class="btn" disabled>Download PNG</button>
       <button id="clearMaskBtn" class="btn" disabled>Clear mask</button>
@@ -147,23 +148,13 @@
 
 <script type="module">
 /* =====================================================================
-   REMOVAL PROCESS — PRECISE AND FAST
+   AUTO-SELECT + MANUAL MASK WORKFLOW
    =====================================================================
-   Fixes over the previous version:
-   ✔ Keep mode validates the AI result — if the model returns no
-     foreground inside the user mask, the original is preserved and
-     the user is warned instead of silently losing the subject.
-   ✔ Fallback validates that flood fill actually removed anything
-     inside the mask — warns instead of reporting a silent no-op.
-   ✔ Mask is dilated + feathered before compositing/erasing, giving
-     clean edges and covering anti-aliasing gaps in the user paint.
-   ✔ Keep mode crops the AI input to the mask's bounding box (with
-     64 px padding) when that's smaller than 80% of the image — big
-     speedups for small subjects, no seam because the composite is
-     still clipped through the mask.
-   ✔ No-mask removal composites through the current alpha, so any
-     previous manual Erase/Restore survives a fresh AI pass.
-   ✔ AI progress callback extracted to remove duplication.
+   ✔ New "Auto-Select Subject" button — uses the same @imgly model's
+     segmentForeground() to generate a precise starting mask in one click.
+   ✔ Mask can then be refined with the existing manual brush tools.
+   ✔ Keeps all previous fixes: validation, dilation/feathering, crop-
+     to-bbox speedup, manual-edit preservation, mobile layout.
    ===================================================================== */
 
 const viewport    = document.getElementById('viewport');
@@ -172,6 +163,7 @@ const vctx        = view.getContext('2d');
 const overlay     = document.getElementById('overlay');
 const octx        = overlay.getContext('2d');
 const fileInput   = document.getElementById('file');
+const autoSelectBtn = document.getElementById('autoSelectBtn');
 const removeBtn   = document.getElementById('removeBtn');
 const downloadBtn = document.getElementById('downloadBtn');
 const resetBtn    = document.getElementById('resetBtn');
@@ -187,12 +179,12 @@ const modeBtns    = Array.from(document.querySelectorAll('.mode'));
 const MAX_DIM          = 2048;
 const MAX_BRUSH_IM     = 600;
 const MASK_TINT        = 'rgba(0, 200, 255, 1)';
-const DILATE_PX        = 3;      // mask dilation radius, image pixels
-const FEATHER_PX       = 2;      // mask blur radius, image pixels
-const AI_CROP_PADDING  = 64;     // padding around bbox for AI crop
-const CROP_THRESHOLD   = 0.80;   // crop only if bbox < 80% of image area
-const AI_MIN_OPAQUE    = 0.05;   // failure if <5% of user mask opaque in AI result
-const FB_MIN_TRANSPARENT = 0.005;// failure if <0.5% of user mask transparent in fallback
+const DILATE_PX        = 3;
+const FEATHER_PX       = 2;
+const AI_CROP_PADDING  = 64;
+const CROP_THRESHOLD   = 0.80;
+const AI_MIN_OPAQUE    = 0.05;
+const FB_MIN_TRANSPARENT = 0.005;
 
 let origCanvas = null;
 let workCanvas = null;
@@ -241,6 +233,7 @@ function loadImageEl(url){
 
 function updateUI(){
   removeBtn.disabled    = !hasImage || busy;
+  autoSelectBtn.disabled= !hasImage || busy;
   downloadBtn.disabled  = !hasImage;
   resetBtn.disabled     = !hasImage;
   fitBtn.disabled       = !hasImage;
@@ -251,6 +244,7 @@ function updateUI(){
 
 function setBusyUI(b){
   removeBtn.disabled    = b || !hasImage;
+  autoSelectBtn.disabled= b || !hasImage;
   removeBtn.textContent = b ? 'Working…' : removeBtnLabel();
 }
 
@@ -386,10 +380,6 @@ function toImage(clientX, clientY){
 /* =====================================================================
    MASK PROCESSING HELPERS
    ===================================================================== */
-
-/* Dilate then feather the user's mask. Returns a new canvas.
-   Dilation covers anti-aliased brush edges; feathering smooths the
-   transition so composites and erases look clean at any zoom. */
 function dilateAndFeatherMask(){
   if (!maskCanvas || !maskPainted) return null;
   const w = maskCanvas.width, h = maskCanvas.height;
@@ -415,7 +405,6 @@ function dilateAndFeatherMask(){
   return feathered;
 }
 
-/* Bounding box of the painted mask, expanded by `padding` px. */
 function getMaskBoundingBox(padding){
   if (!maskCanvas || !maskPainted) return null;
   const w = maskCanvas.width, h = maskCanvas.height;
@@ -441,9 +430,6 @@ function getMaskBoundingBox(padding){
   return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
 }
 
-/* Is there meaningful opaque foreground inside the user's mask?
-   Guards against the AI returning fully-transparent pixels where the
-   user painted — which would otherwise silently delete the subject. */
 function hasOpaqueInsideMask(resultCanvas, checkMask, threshold){
   const w = resultCanvas.width, h = resultCanvas.height;
   const rData = resultCanvas.getContext('2d').getImageData(0, 0, w, h).data;
@@ -460,9 +446,6 @@ function hasOpaqueInsideMask(resultCanvas, checkMask, threshold){
   return (opaqueCount / maskCount) >= threshold;
 }
 
-/* Did the fallback produce ANY transparent pixels inside the mask?
-   Guards against flood-fill producing a no-op when the local
-   background differs from the outer image border palette. */
 function hasTransparentInsideMask(resultCanvas, checkMask, threshold){
   const w = resultCanvas.width, h = resultCanvas.height;
   const rData = resultCanvas.getContext('2d').getImageData(0, 0, w, h).data;
@@ -479,8 +462,6 @@ function hasTransparentInsideMask(resultCanvas, checkMask, threshold){
   return (transparentCount / maskCount) >= threshold;
 }
 
-/* Build a mask from the current workCanvas alpha.
-   Used by the no-mask path so manual Erase/Restore survives an AI pass. */
 function getCurrentAlphaMask(){
   const w = workCanvas.width, h = workCanvas.height;
   const mask = document.createElement('canvas');
@@ -493,9 +474,6 @@ function getCurrentAlphaMask(){
   return mask;
 }
 
-/* Apply `sourceCanvas` to workCanvas, clipped through `processingMask`.
-   All compositing (Keep mode, no-mask, fallback) goes through here so
-   the behaviour stays consistent and auditable. */
 function compositeWithMask(sourceCanvas, processingMask){
   const c = workCanvas.getContext('2d');
   const w = workCanvas.width, h = workCanvas.height;
@@ -551,7 +529,7 @@ async function loadFile(file){
     hasImage = true;
     updateUI();
     fitView();
-    setStatus('Image loaded. Switch to Mask and paint the subject, then pick Keep or Hide.');
+    setStatus('Image loaded. Use Auto-Select for a starting mask, or paint manually.');
   } catch (e) {
     console.error(e);
     setStatus('Could not read that image.');
@@ -786,8 +764,8 @@ modeBtns.forEach((btn) => {
     modeBtns.forEach((b) => b.classList.toggle('active', b === btn));
     updateUI();
     setStatus(maskMode === 'keep'
-      ? 'Keep mode: the masked subject will be revealed (background around it removed).'
-      : 'Hide mode: the masked subject will be removed; the rest of the image stays.');
+      ? 'Keep mode: the masked subject will be revealed.'
+      : 'Hide mode: the masked subject will be removed.');
   });
 });
 
@@ -797,9 +775,9 @@ toolBtns.forEach((btn) => {
     toolBtns.forEach((b) => b.classList.toggle('active', b === btn));
     viewport.style.cursor = tool === 'pan' ? 'grab' : 'crosshair';
     renderOverlay();
-    if (tool === 'mask')        setStatus('Paint over the subject. Then pick Keep or Hide and apply.');
-    else if (tool === 'erase')  setStatus('Drag on the canvas to erase from the result.');
-    else if (tool === 'restore')setStatus('Drag to restore original pixels from the source.');
+    if (tool === 'mask')        setStatus('Paint over the subject, or use Auto-Select for a starting mask.');
+    else if (tool === 'erase')  setStatus('Drag to erase from the result.');
+    else if (tool === 'restore')setStatus('Drag to restore original pixels.');
     else                        setStatus('Drag to pan, scroll or pinch to zoom.');
   });
 });
@@ -871,7 +849,7 @@ window.addEventListener('paste', (e) => {
 });
 
 /* =====================================================================
-   AI MODEL LOADER
+   AI MODEL LOADER — now returns both functions
    ===================================================================== */
 async function loadRemover(){
   const urls = [
@@ -881,14 +859,71 @@ async function loadRemover(){
   for (const url of urls){
     try {
       const mod = await import(/* webpackIgnore: true */ url);
-      const fn = mod.removeBackground || mod.default;
-      if (typeof fn === 'function') return fn;
+      const removeBackground = mod.removeBackground || mod.default;
+      const segmentForeground = mod.segmentForeground;
+      if (typeof removeBackground === 'function'){
+        return { removeBackground, segmentForeground };
+      }
     } catch (err){
       console.warn('CDN failed:', url, err);
     }
   }
   return null;
 }
+
+/* =====================================================================
+   AUTO-SELECT SUBJECT (uses segmentForeground)
+   ===================================================================== */
+async function autoSelectSubject(){
+  if (!hasImage || busy) return;
+
+  busy = true;
+  setBusyUI(true);
+  setStatus('Generating auto mask…');
+
+  try {
+    const api = await loadRemover();
+    if (!api || !api.segmentForeground) throw new Error('segmentForeground unavailable');
+
+    const srcBlob = await new Promise(r => origCanvas.toBlob(r, 'image/png'));
+    if (!srcBlob) throw new Error('Could not encode image');
+
+    const maskBlob = await api.segmentForeground(srcBlob, {
+      output: { format: 'image/png' },
+      progress: makeProgressHandler()
+    });
+
+    const bmp = await createImageBitmap(maskBlob);
+
+    // Clear existing mask and draw the new one (tinted cyan for visibility)
+    const mctx = maskCanvas.getContext('2d');
+    mctx.clearRect(0, 0, maskCanvas.width, maskCanvas.height);
+    mctx.drawImage(bmp, 0, 0, maskCanvas.width, maskCanvas.height);
+    if (bmp.close) bmp.close();
+
+    // Tint the white/grayscale mask to the app's cyan color
+    mctx.globalCompositeOperation = 'source-in';
+    mctx.fillStyle = MASK_TINT;
+    mctx.fillRect(0, 0, maskCanvas.width, maskCanvas.height);
+    mctx.globalCompositeOperation = 'source-over';
+
+    maskPainted = true;
+    updateUI();
+    renderOverlay();
+    setStatus('Auto mask applied. Refine with the Mask brush if needed, then Apply.');
+  } catch (err){
+    console.error(err);
+    setStatus('Auto-select failed. You can still paint the mask manually.');
+  } finally {
+    busy = false;
+    setBusyUI(false);
+    updateUI();
+    render();
+    renderOverlay();
+  }
+}
+
+autoSelectBtn.addEventListener('click', autoSelectSubject);
 
 /* =====================================================================
    APPLY — routes Hide (local erase) vs Keep (AI)
@@ -935,12 +970,12 @@ async function doRemoveBackground(){
   }, 6000);
 
   try {
-    const removeBackground = await loadRemover();
-    if (!removeBackground) throw new Error('Model module unavailable');
+    const api = await loadRemover();
+    if (!api) throw new Error('Model module unavailable');
+    const { removeBackground } = api;
 
     let aiResultCanvas = null;
 
-    // --- Try cropped AI when mask exists and crop is meaningfully smaller ---
     if (maskPainted){
       const bbox = getMaskBoundingBox(AI_CROP_PADDING);
       const cropArea = bbox ? bbox.w * bbox.h : Infinity;
@@ -970,7 +1005,6 @@ async function doRemoveBackground(){
       }
     }
 
-    // --- Full-image AI (no mask, or mask too large to bother cropping) ---
     if (!aiResultCanvas){
       const srcBlob = await new Promise(r => origCanvas.toBlob(r, 'image/png'));
       if (!srcBlob) throw new Error('Could not encode source');
@@ -988,7 +1022,6 @@ async function doRemoveBackground(){
       if (bmp.close) bmp.close();
     }
 
-    // --- VALIDATION: did AI find foreground inside the user's mask? ---
     if (maskPainted){
       const ok = hasOpaqueInsideMask(aiResultCanvas, maskCanvas, AI_MIN_OPAQUE);
       if (!ok){
@@ -998,14 +1031,12 @@ async function doRemoveBackground(){
       }
     }
 
-    // --- COMPOSITE ---
     if (maskPainted){
       const processingMask = dilateAndFeatherMask();
       compositeWithMask(aiResultCanvas, processingMask);
       clearMask();
       setStatus('Masked subject kept. Refine or mask another area.');
     } else {
-      // Respect existing manual erases: clip AI result through current alpha.
       const alphaMask = getCurrentAlphaMask();
       compositeWithMask(aiResultCanvas, alphaMask);
       setStatus('Background removed. Use Erase / Restore to fine-tune.');
