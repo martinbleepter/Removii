@@ -147,19 +147,23 @@
 
 <script type="module">
 /* =====================================================================
-   KEEP / HIDE MASK MODES
+   REMOVAL PROCESS — PRECISE AND FAST
    =====================================================================
-   ✔ Keep mode (default): AI result applied inside the mask — the masked
-     subject is revealed with its background removed. Original preserved
-     outside the mask.
-   ✔ Hide mode: masked region is erased (transparent); everything else
-     preserved. Runs as a local erase — no AI needed, so it's instant
-     even on large images.
-   ✔ Button label updates: "Remove Background" / "Process Masked Area"
-     / "Remove Masked Subject".
-   ✔ Mask clears on success in both modes.
-   ✔ All prior fixes retained (COEP credentialless, worker fallback,
-     mobile layout, pinch-zoom, overlay opacity).
+   Fixes over the previous version:
+   ✔ Keep mode validates the AI result — if the model returns no
+     foreground inside the user mask, the original is preserved and
+     the user is warned instead of silently losing the subject.
+   ✔ Fallback validates that flood fill actually removed anything
+     inside the mask — warns instead of reporting a silent no-op.
+   ✔ Mask is dilated + feathered before compositing/erasing, giving
+     clean edges and covering anti-aliasing gaps in the user paint.
+   ✔ Keep mode crops the AI input to the mask's bounding box (with
+     64 px padding) when that's smaller than 80% of the image — big
+     speedups for small subjects, no seam because the composite is
+     still clipped through the mask.
+   ✔ No-mask removal composites through the current alpha, so any
+     previous manual Erase/Restore survives a fresh AI pass.
+   ✔ AI progress callback extracted to remove duplication.
    ===================================================================== */
 
 const viewport    = document.getElementById('viewport');
@@ -180,9 +184,15 @@ const dropHint    = document.getElementById('drop');
 const toolBtns    = Array.from(document.querySelectorAll('.tool'));
 const modeBtns    = Array.from(document.querySelectorAll('.mode'));
 
-const MAX_DIM      = 2048;
-const MAX_BRUSH_IM = 600;
-const MASK_TINT    = 'rgba(0, 200, 255, 1)';
+const MAX_DIM          = 2048;
+const MAX_BRUSH_IM     = 600;
+const MASK_TINT        = 'rgba(0, 200, 255, 1)';
+const DILATE_PX        = 3;      // mask dilation radius, image pixels
+const FEATHER_PX       = 2;      // mask blur radius, image pixels
+const AI_CROP_PADDING  = 64;     // padding around bbox for AI crop
+const CROP_THRESHOLD   = 0.80;   // crop only if bbox < 80% of image area
+const AI_MIN_OPAQUE    = 0.05;   // failure if <5% of user mask opaque in AI result
+const FB_MIN_TRANSPARENT = 0.005;// failure if <0.5% of user mask transparent in fallback
 
 let origCanvas = null;
 let workCanvas = null;
@@ -190,7 +200,7 @@ let maskCanvas = null;
 let hasImage   = false;
 let maskPainted= false;
 let busy       = false;
-let maskMode   = 'keep';   // 'keep' | 'hide'
+let maskMode   = 'keep';
 
 let scale = 1, tx = 0, ty = 0;
 let dpr = Math.max(1, window.devicePixelRatio || 1);
@@ -259,6 +269,16 @@ function scheduleRender(){
   });
 }
 
+function makeProgressHandler(){
+  let lastPct = -1;
+  return (_key, current, total) => {
+    if (total > 0){
+      const pct = Math.round((current / total) * 100);
+      if (pct !== lastPct){ lastPct = pct; setStatus('Processing… ' + pct + '%'); }
+    }
+  };
+}
+
 /* =====================================================================
    RENDER / VIEW TRANSFORM
    ===================================================================== */
@@ -283,10 +303,8 @@ function resize(){
   overlay.style.height = r.height + 'px';
 
   if (hasImage && (oldW !== r.width || oldH !== r.height)){
-    const newCx = r.width  / 2;
-    const newCy = r.height / 2;
-    tx = newCx - imgCx * scale;
-    ty = newCy - imgCy * scale;
+    tx = r.width  / 2 - imgCx * scale;
+    ty = r.height / 2 - imgCy * scale;
   }
 
   render();
@@ -363,6 +381,143 @@ function toImage(clientX, clientY){
     x: (clientX - r.left - tx) / scale,
     y: (clientY - r.top  - ty) / scale
   };
+}
+
+/* =====================================================================
+   MASK PROCESSING HELPERS
+   ===================================================================== */
+
+/* Dilate then feather the user's mask. Returns a new canvas.
+   Dilation covers anti-aliased brush edges; feathering smooths the
+   transition so composites and erases look clean at any zoom. */
+function dilateAndFeatherMask(){
+  if (!maskCanvas || !maskPainted) return null;
+  const w = maskCanvas.width, h = maskCanvas.height;
+
+  const dilated = document.createElement('canvas');
+  dilated.width = w; dilated.height = h;
+  const dctx = dilated.getContext('2d');
+
+  const steps = 8;
+  dctx.drawImage(maskCanvas, 0, 0);
+  for (let i = 0; i < steps; i++){
+    const ang = (i / steps) * Math.PI * 2;
+    dctx.drawImage(maskCanvas, Math.cos(ang) * DILATE_PX, Math.sin(ang) * DILATE_PX);
+  }
+
+  const feathered = document.createElement('canvas');
+  feathered.width = w; feathered.height = h;
+  const fctx = feathered.getContext('2d');
+  fctx.filter = `blur(${FEATHER_PX}px)`;
+  fctx.drawImage(dilated, 0, 0);
+  fctx.filter = 'none';
+
+  return feathered;
+}
+
+/* Bounding box of the painted mask, expanded by `padding` px. */
+function getMaskBoundingBox(padding){
+  if (!maskCanvas || !maskPainted) return null;
+  const w = maskCanvas.width, h = maskCanvas.height;
+  const data = maskCanvas.getContext('2d').getImageData(0, 0, w, h).data;
+
+  let minX = w, minY = h, maxX = -1, maxY = -1;
+  for (let y = 0; y < h; y += 2){
+    for (let x = 0; x < w; x += 2){
+      if (data[(y * w + x) * 4 + 3] > 10){
+        if (x < minX) minX = x;
+        if (x > maxX) maxX = x;
+        if (y < minY) minY = y;
+        if (y > maxY) maxY = y;
+      }
+    }
+  }
+  if (maxX < 0) return null;
+
+  minX = Math.max(0, minX - padding);
+  minY = Math.max(0, minY - padding);
+  maxX = Math.min(w - 1, maxX + padding);
+  maxY = Math.min(h - 1, maxY + padding);
+  return { x: minX, y: minY, w: maxX - minX + 1, h: maxY - minY + 1 };
+}
+
+/* Is there meaningful opaque foreground inside the user's mask?
+   Guards against the AI returning fully-transparent pixels where the
+   user painted — which would otherwise silently delete the subject. */
+function hasOpaqueInsideMask(resultCanvas, checkMask, threshold){
+  const w = resultCanvas.width, h = resultCanvas.height;
+  const rData = resultCanvas.getContext('2d').getImageData(0, 0, w, h).data;
+  const mData = checkMask.getContext('2d').getImageData(0, 0, w, h).data;
+
+  let maskCount = 0, opaqueCount = 0;
+  for (let i = 0; i < w * h; i += 4){
+    if (mData[i + 3] > 50){
+      maskCount++;
+      if (rData[i + 3] > 50) opaqueCount++;
+    }
+  }
+  if (maskCount === 0) return true;
+  return (opaqueCount / maskCount) >= threshold;
+}
+
+/* Did the fallback produce ANY transparent pixels inside the mask?
+   Guards against flood-fill producing a no-op when the local
+   background differs from the outer image border palette. */
+function hasTransparentInsideMask(resultCanvas, checkMask, threshold){
+  const w = resultCanvas.width, h = resultCanvas.height;
+  const rData = resultCanvas.getContext('2d').getImageData(0, 0, w, h).data;
+  const mData = checkMask.getContext('2d').getImageData(0, 0, w, h).data;
+
+  let maskCount = 0, transparentCount = 0;
+  for (let i = 0; i < w * h; i += 4){
+    if (mData[i + 3] > 50){
+      maskCount++;
+      if (rData[i + 3] < 50) transparentCount++;
+    }
+  }
+  if (maskCount === 0) return true;
+  return (transparentCount / maskCount) >= threshold;
+}
+
+/* Build a mask from the current workCanvas alpha.
+   Used by the no-mask path so manual Erase/Restore survives an AI pass. */
+function getCurrentAlphaMask(){
+  const w = workCanvas.width, h = workCanvas.height;
+  const mask = document.createElement('canvas');
+  mask.width = w; mask.height = h;
+  const mctx = mask.getContext('2d');
+  mctx.fillStyle = '#fff';
+  mctx.fillRect(0, 0, w, h);
+  mctx.globalCompositeOperation = 'destination-in';
+  mctx.drawImage(workCanvas, 0, 0);
+  return mask;
+}
+
+/* Apply `sourceCanvas` to workCanvas, clipped through `processingMask`.
+   All compositing (Keep mode, no-mask, fallback) goes through here so
+   the behaviour stays consistent and auditable. */
+function compositeWithMask(sourceCanvas, processingMask){
+  const c = workCanvas.getContext('2d');
+  const w = workCanvas.width, h = workCanvas.height;
+
+  if (!processingMask){
+    c.clearRect(0, 0, w, h);
+    c.drawImage(sourceCanvas, 0, 0, w, h);
+    return;
+  }
+
+  const temp = document.createElement('canvas');
+  temp.width = w; temp.height = h;
+  const tctx = temp.getContext('2d');
+  tctx.drawImage(sourceCanvas, 0, 0, w, h);
+  tctx.globalCompositeOperation = 'destination-in';
+  tctx.drawImage(processingMask, 0, 0);
+
+  c.save();
+  c.globalCompositeOperation = 'destination-out';
+  c.drawImage(processingMask, 0, 0);
+  c.restore();
+  c.drawImage(temp, 0, 0);
 }
 
 /* =====================================================================
@@ -448,13 +603,11 @@ function strokeMaskTo(x, y){
   const step = Math.max(1, rad * 0.15);
   const mctx = maskCanvas.getContext('2d');
   mctx.fillStyle = MASK_TINT;
-
   const paint = (cx, cy) => {
     mctx.beginPath();
     mctx.arc(cx, cy, rad, 0, Math.PI * 2);
     mctx.fill();
   };
-
   if (lastPt){
     const dx = x - lastPt.x, dy = y - lastPt.y;
     const dist = Math.hypot(dx, dy);
@@ -466,7 +619,6 @@ function strokeMaskTo(x, y){
     paint(x, y);
   }
   lastPt = { x, y };
-
   if (!maskPainted){ maskPainted = true; updateUI(); }
 }
 
@@ -490,19 +642,16 @@ viewport.addEventListener('pointerdown', (e) => {
     panning = false;
     lastPt  = null;
     primaryPointerId = null;
-
     const [p1, p2] = [...activePointers.values()];
     const r = viewport.getBoundingClientRect();
     const midX = (p1.x + p2.x) / 2;
     const midY = (p1.y + p2.y) / 2;
-
     pinchState = {
       startDist:  Math.hypot(p2.x - p1.x, p2.y - p1.y),
       startScale: scale,
       imgMidX:    (midX - r.left - tx) / scale,
       imgMidY:    (midY - r.top  - ty) / scale,
     };
-
     try { viewport.setPointerCapture(e.pointerId); } catch (_) {}
     e.preventDefault();
     return;
@@ -546,14 +695,11 @@ viewport.addEventListener('pointermove', (e) => {
     const dist = Math.hypot(p2.x - p1.x, p2.y - p1.y);
     const midX = (p1.x + p2.x) / 2;
     const midY = (p1.y + p2.y) / 2;
-
     const factor = dist / Math.max(1, pinchState.startDist);
     const ns = Math.min(24, Math.max(0.02, pinchState.startScale * factor));
-
     scale = ns;
     tx = (midX - r.left) - pinchState.imgMidX * ns;
     ty = (midY - r.top ) - pinchState.imgMidY * ns;
-
     render();
     renderOverlay();
     return;
@@ -586,7 +732,6 @@ viewport.addEventListener('pointermove', (e) => {
 function handlePointerEnd(e){
   activePointers.delete(e.pointerId);
   if (activePointers.size < 2) pinchState = null;
-
   if (e.pointerId === primaryPointerId){
     primaryPointerId = null;
     if (panning || drawing){
@@ -602,10 +747,7 @@ window.addEventListener('pointerup', handlePointerEnd);
 window.addEventListener('pointercancel', handlePointerEnd);
 
 viewport.addEventListener('pointerleave', () => {
-  if (activePointers.size === 0){
-    cursor = null;
-    renderOverlay();
-  }
+  if (activePointers.size === 0){ cursor = null; renderOverlay(); }
 });
 
 viewport.addEventListener('wheel', (e) => {
@@ -636,7 +778,7 @@ window.addEventListener('keyup', (e) => {
 });
 
 /* =====================================================================
-   MODE BUTTONS
+   MODE / TOOL BUTTONS
    ===================================================================== */
 modeBtns.forEach((btn) => {
   btn.addEventListener('click', () => {
@@ -644,25 +786,21 @@ modeBtns.forEach((btn) => {
     modeBtns.forEach((b) => b.classList.toggle('active', b === btn));
     updateUI();
     setStatus(maskMode === 'keep'
-      ? 'Keep mode: masked subject will be revealed (background removed around it).'
-      : 'Hide mode: masked subject will be removed; the rest stays.');
+      ? 'Keep mode: the masked subject will be revealed (background around it removed).'
+      : 'Hide mode: the masked subject will be removed; the rest of the image stays.');
   });
 });
 
-/* =====================================================================
-   TOOLBAR WIRING
-   ===================================================================== */
 toolBtns.forEach((btn) => {
   btn.addEventListener('click', () => {
     tool = btn.dataset.tool;
     toolBtns.forEach((b) => b.classList.toggle('active', b === btn));
     viewport.style.cursor = tool === 'pan' ? 'grab' : 'crosshair';
     renderOverlay();
-
-    if (tool === 'mask')       setStatus('Paint over the subject. Then pick Keep or Hide and apply.');
-    else if (tool === 'erase') setStatus('Drag on the canvas to erase from the result.');
+    if (tool === 'mask')        setStatus('Paint over the subject. Then pick Keep or Hide and apply.');
+    else if (tool === 'erase')  setStatus('Drag on the canvas to erase from the result.');
     else if (tool === 'restore')setStatus('Drag to restore original pixels from the source.');
-    else                       setStatus('Drag to pan, scroll or pinch to zoom.');
+    else                        setStatus('Drag to pan, scroll or pinch to zoom.');
   });
 });
 
@@ -733,124 +871,6 @@ window.addEventListener('paste', (e) => {
 });
 
 /* =====================================================================
-   COMPOSITE HELPER  —  Keep mode only
-   Apply AI result inside the mask, keep original outside.
-   ===================================================================== */
-function compositeWithMask(sourceCanvas){
-  const c = workCanvas.getContext('2d');
-  const w = workCanvas.width, h = workCanvas.height;
-
-  if (!maskPainted || !maskCanvas){
-    c.clearRect(0, 0, w, h);
-    c.drawImage(sourceCanvas, 0, 0, w, h);
-    return;
-  }
-
-  const temp = document.createElement('canvas');
-  temp.width = w; temp.height = h;
-  const tctx = temp.getContext('2d');
-  tctx.drawImage(sourceCanvas, 0, 0, w, h);
-  tctx.globalCompositeOperation = 'destination-in';
-  tctx.drawImage(maskCanvas, 0, 0);
-
-  c.save();
-  c.globalCompositeOperation = 'destination-out';
-  c.drawImage(maskCanvas, 0, 0);
-  c.restore();
-
-  c.drawImage(temp, 0, 0);
-}
-
-/* =====================================================================
-   APPLY  —  routes to Hide (local erase) or Keep (AI)
-   ===================================================================== */
-async function doRemoveBackground(){
-  if (!hasImage || busy) return;
-
-  // ---------- HIDE MODE: no AI, just erase masked pixels ----------
-  if (maskPainted && maskMode === 'hide'){
-    busy = true;
-    setBusyUI(true);
-    setStatus('Removing masked subject…');
-
-    // Let the UI paint before the (sync) erase
-    await new Promise(r => requestAnimationFrame(r));
-
-    const c = workCanvas.getContext('2d');
-    c.save();
-    c.globalCompositeOperation = 'destination-out';
-    c.drawImage(maskCanvas, 0, 0);
-    c.restore();
-
-    clearMask();
-    busy = false;
-    setBusyUI(false);
-    updateUI();
-    render();
-    renderOverlay();
-    setStatus('Masked subject hidden. Refine with Erase / Restore if needed.');
-    return;
-  }
-
-  // ---------- KEEP MODE (or no mask): run AI ----------
-  busy = true;
-  setBusyUI(true);
-  setStatus('Loading AI model (first run downloads ~40 MB)…');
-
-  const downloadNote = setTimeout(() => {
-    if (busy) setStatus('Still downloading model files (first run only)…');
-  }, 6000);
-
-  try {
-    const removeBackground = await loadRemover();
-    if (!removeBackground) throw new Error('Model module unavailable');
-
-    const srcBlob = await new Promise((res) => origCanvas.toBlob(res, 'image/png'));
-    if (!srcBlob) throw new Error('Could not encode source image');
-
-    let lastPct = -1;
-    const outBlob = await removeBackground(srcBlob, {
-      output: { format: 'image/png' },
-      progress: (_key, current, total) => {
-        if (total > 0){
-          const pct = Math.round((current / total) * 100);
-          if (pct !== lastPct){
-            lastPct = pct;
-            setStatus('Processing… ' + pct + '%');
-          }
-        }
-      }
-    });
-
-    const bmp = await createImageBitmap(outBlob);
-    const srcCanvas = document.createElement('canvas');
-    srcCanvas.width = workCanvas.width;
-    srcCanvas.height = workCanvas.height;
-    srcCanvas.getContext('2d').drawImage(bmp, 0, 0, srcCanvas.width, srcCanvas.height);
-    if (bmp.close) bmp.close();
-
-    const hadMask = maskPainted;
-    compositeWithMask(srcCanvas);
-    clearMask();
-
-    setStatus(hadMask
-      ? 'Masked subject kept. Refine with Erase / Restore if needed.'
-      : 'Background removed. Use Erase / Restore to fine-tune.');
-  } catch (err){
-    console.error(err);
-    setStatus('AI model unavailable — running built-in fallback (edge-aware flood fill)…');
-    await quickRemove();
-  } finally {
-    clearTimeout(downloadNote);
-    busy = false;
-    setBusyUI(false);
-    updateUI();
-    render();
-    renderOverlay();
-  }
-}
-
-/* =====================================================================
    AI MODEL LOADER
    ===================================================================== */
 async function loadRemover(){
@@ -871,14 +891,147 @@ async function loadRemover(){
 }
 
 /* =====================================================================
-   FALLBACK (Web Worker, keep-mode compositing)
+   APPLY — routes Hide (local erase) vs Keep (AI)
+   ===================================================================== */
+async function doRemoveBackground(){
+  if (!hasImage || busy) return;
+
+  // ---------- HIDE MODE: local erase, no AI ----------
+  if (maskPainted && maskMode === 'hide'){
+    busy = true;
+    setBusyUI(true);
+    setStatus('Removing masked subject…');
+
+    await new Promise(r => requestAnimationFrame(r));
+    try {
+      const processingMask = dilateAndFeatherMask();
+      if (!processingMask) throw new Error('Mask preparation failed');
+
+      const c = workCanvas.getContext('2d');
+      c.save();
+      c.globalCompositeOperation = 'destination-out';
+      c.drawImage(processingMask, 0, 0);
+      c.restore();
+
+      clearMask();
+      setStatus('Masked subject hidden. Refine with Erase / Restore if needed.');
+    } finally {
+      busy = false;
+      setBusyUI(false);
+      updateUI();
+      render();
+      renderOverlay();
+    }
+    return;
+  }
+
+  // ---------- KEEP MODE or NO MASK: run AI ----------
+  busy = true;
+  setBusyUI(true);
+  setStatus('Loading AI model (first run downloads ~40 MB)…');
+
+  const downloadNote = setTimeout(() => {
+    if (busy) setStatus('Still downloading model files (first run only)…');
+  }, 6000);
+
+  try {
+    const removeBackground = await loadRemover();
+    if (!removeBackground) throw new Error('Model module unavailable');
+
+    let aiResultCanvas = null;
+
+    // --- Try cropped AI when mask exists and crop is meaningfully smaller ---
+    if (maskPainted){
+      const bbox = getMaskBoundingBox(AI_CROP_PADDING);
+      const cropArea = bbox ? bbox.w * bbox.h : Infinity;
+      const fullArea = workCanvas.width * workCanvas.height;
+
+      if (bbox && (cropArea / fullArea) < CROP_THRESHOLD){
+        const crop = document.createElement('canvas');
+        crop.width = bbox.w; crop.height = bbox.h;
+        crop.getContext('2d').drawImage(
+          origCanvas, bbox.x, bbox.y, bbox.w, bbox.h, 0, 0, bbox.w, bbox.h
+        );
+
+        const srcBlob = await new Promise(r => crop.toBlob(r, 'image/png'));
+        if (!srcBlob) throw new Error('Could not encode crop');
+
+        const outBlob = await removeBackground(srcBlob, {
+          output:   { format: 'image/png' },
+          progress: makeProgressHandler()
+        });
+
+        const bmp = await createImageBitmap(outBlob);
+        aiResultCanvas = document.createElement('canvas');
+        aiResultCanvas.width  = workCanvas.width;
+        aiResultCanvas.height = workCanvas.height;
+        aiResultCanvas.getContext('2d').drawImage(bmp, bbox.x, bbox.y, bbox.w, bbox.h);
+        if (bmp.close) bmp.close();
+      }
+    }
+
+    // --- Full-image AI (no mask, or mask too large to bother cropping) ---
+    if (!aiResultCanvas){
+      const srcBlob = await new Promise(r => origCanvas.toBlob(r, 'image/png'));
+      if (!srcBlob) throw new Error('Could not encode source');
+
+      const outBlob = await removeBackground(srcBlob, {
+        output:   { format: 'image/png' },
+        progress: makeProgressHandler()
+      });
+
+      const bmp = await createImageBitmap(outBlob);
+      aiResultCanvas = document.createElement('canvas');
+      aiResultCanvas.width  = workCanvas.width;
+      aiResultCanvas.height = workCanvas.height;
+      aiResultCanvas.getContext('2d').drawImage(bmp, 0, 0, aiResultCanvas.width, aiResultCanvas.height);
+      if (bmp.close) bmp.close();
+    }
+
+    // --- VALIDATION: did AI find foreground inside the user's mask? ---
+    if (maskPainted){
+      const ok = hasOpaqueInsideMask(aiResultCanvas, maskCanvas, AI_MIN_OPAQUE);
+      if (!ok){
+        clearMask();
+        setStatus('AI returned no foreground — original preserved. Try a different subject, or use Hide mode.');
+        return;
+      }
+    }
+
+    // --- COMPOSITE ---
+    if (maskPainted){
+      const processingMask = dilateAndFeatherMask();
+      compositeWithMask(aiResultCanvas, processingMask);
+      clearMask();
+      setStatus('Masked subject kept. Refine or mask another area.');
+    } else {
+      // Respect existing manual erases: clip AI result through current alpha.
+      const alphaMask = getCurrentAlphaMask();
+      compositeWithMask(aiResultCanvas, alphaMask);
+      setStatus('Background removed. Use Erase / Restore to fine-tune.');
+    }
+  } catch (err){
+    console.error(err);
+    setStatus('AI model unavailable — running built-in fallback…');
+    await quickRemove();
+  } finally {
+    clearTimeout(downloadNote);
+    busy = false;
+    setBusyUI(false);
+    updateUI();
+    render();
+    renderOverlay();
+  }
+}
+
+/* =====================================================================
+   FALLBACK — Web Worker flood fill with validation
    ===================================================================== */
 function quickRemove(){
   return new Promise((resolve) => {
     const w = origCanvas.width;
     const h = origCanvas.height;
-    const ctx = origCanvas.getContext('2d');
-    const imageData = ctx.getImageData(0, 0, w, h);
+    const imageData = origCanvas.getContext('2d').getImageData(0, 0, w, h);
     const data = imageData.data;
 
     let br = 0, bg = 0, bb = 0, n = 0;
@@ -938,15 +1091,25 @@ function quickRemove(){
       srcCanvas.width = w; srcCanvas.height = h;
       srcCanvas.getContext('2d').putImageData(new ImageData(newData, w, h), 0, 0);
 
-      const hadMask = maskPainted;
-      compositeWithMask(srcCanvas);
-      clearMask();
+      if (maskPainted){
+        const ok = hasTransparentInsideMask(srcCanvas, maskCanvas, FB_MIN_TRANSPARENT);
+        if (!ok){
+          clearMask();
+          setStatus('Fallback could not remove background inside mask — original preserved. Try Hide mode or manual Erase.');
+        } else {
+          const processingMask = dilateAndFeatherMask();
+          compositeWithMask(srcCanvas, processingMask);
+          clearMask();
+          setStatus('Masked subject processed (fallback). Refine with Erase / Restore.');
+        }
+      } else {
+        const alphaMask = getCurrentAlphaMask();
+        compositeWithMask(srcCanvas, alphaMask);
+        setStatus('Quick removal applied (fallback). Refine with Erase / Restore.');
+      }
 
       worker.terminate();
       URL.revokeObjectURL(workerUrl);
-      setStatus(hadMask
-        ? 'Masked subject kept (fallback). Refine with Erase / Restore if needed.'
-        : 'Quick removal applied. Refine with Erase / Restore.');
       render();
       resolve();
     };
